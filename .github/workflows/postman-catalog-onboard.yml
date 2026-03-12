@@ -1,0 +1,86 @@
+name: Postman Catalog Onboard (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      workspace_id:
+        description: 'Postman Workspace ID'
+        required: true
+        type: string
+      collection_pattern:
+        description: 'Substring to match the API collection name'
+        required: false
+        type: string
+        default: 'API'
+      environment_uid:
+        description: 'Postman Environment UID for the collection run'
+        required: false
+        type: string
+      monitor_pattern:
+        description: 'Substring to match the monitor name'
+        required: false
+        type: string
+        default: 'Health Monitor'
+    secrets:
+      POSTMAN_API_KEY:
+        required: true
+
+jobs:
+  catalog-onboard:
+    name: Postman Catalog Onboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Postman CLI
+        run: curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
+
+      - name: Login to Postman
+        run: postman login --with-api-key ${{ secrets.POSTMAN_API_KEY }}
+
+      - name: Resolve Collection UID
+        id: resolve
+        env:
+          WS_ID: ${{ inputs.workspace_id }}
+          PATTERN: ${{ inputs.collection_pattern }}
+        run: |
+          COLL_UID=$(curl -sf "https://api.getpostman.com/collections?workspace=$WS_ID" \
+            -H "x-api-key: ${{ secrets.POSTMAN_API_KEY }}" \
+            | jq -r --arg pat "$PATTERN" '.collections[] | select(.name | contains($pat)) | .uid' | head -1)
+          echo "collection_uid=$COLL_UID" >> $GITHUB_OUTPUT
+          echo "Resolved collection: $COLL_UID"
+
+      - name: Run Collection
+        env:
+          ENV_UID: ${{ inputs.environment_uid }}
+        run: |
+          ARGS=""
+          if [ -n "$ENV_UID" ]; then
+            ARGS="-e $ENV_UID"
+          fi
+          postman collection run ${{ steps.resolve.outputs.collection_uid }} \
+            $ARGS \
+            --postman-api-key ${{ secrets.POSTMAN_API_KEY }}
+
+      - name: Trigger Monitor
+        continue-on-error: true
+        env:
+          MON_PATTERN: ${{ inputs.monitor_pattern }}
+        run: |
+          MONITOR_UID=$(curl -sf "https://api.getpostman.com/monitors" \
+            -H "x-api-key: ${{ secrets.POSTMAN_API_KEY }}" \
+            | jq -r --arg pat "$MON_PATTERN" '.monitors[] | select(.name | contains($pat)) | .uid' | head -1)
+          if [ -n "$MONITOR_UID" ]; then
+            echo "Triggering monitor $MONITOR_UID"
+            curl -sf -X POST "https://api.getpostman.com/monitors/$MONITOR_UID/run" \
+              -H "x-api-key: ${{ secrets.POSTMAN_API_KEY }}" || true
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Postman Catalog Onboard" >> $GITHUB_STEP_SUMMARY
+          echo "| Asset | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Workspace | [${{ inputs.workspace_id }}](https://go.postman.co/workspace/${{ inputs.workspace_id }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Collection | ${{ steps.resolve.outputs.collection_uid }} |" >> $GITHUB_STEP_SUMMARY

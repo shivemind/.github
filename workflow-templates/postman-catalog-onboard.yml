@@ -1,0 +1,105 @@
+name: Postman Catalog Onboard
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      workspace_id:
+        description: 'Postman Workspace ID (UUID)'
+        required: false
+      collection_name_pattern:
+        description: 'Substring to match collection name (e.g. "Billing API")'
+        required: false
+      monitor_name_pattern:
+        description: 'Substring to match monitor name (e.g. "Billing API - Health")'
+        required: false
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: read
+
+env:
+  WORKSPACE_ID: ${{ inputs.workspace_id || vars.POSTMAN_WORKSPACE_ID || secrets.POSTMAN_WORKSPACE_ID }}
+  COLL_PATTERN: ${{ inputs.collection_name_pattern || vars.POSTMAN_COLLECTION_PATTERN || 'API' }}
+  MON_PATTERN: ${{ inputs.monitor_name_pattern || vars.POSTMAN_MONITOR_PATTERN || 'Health Monitor' }}
+
+jobs:
+  collection-run:
+    name: Run API Collection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Postman CLI
+        run: curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
+
+      - name: Login to Postman
+        run: postman login --with-api-key ${{ secrets.POSTMAN_API_KEY }}
+
+      - name: Resolve Collection UID
+        id: resolve
+        run: |
+          if [ -z "$WORKSPACE_ID" ]; then
+            echo "::error::WORKSPACE_ID not set. Set POSTMAN_WORKSPACE_ID as a repo variable or secret."
+            exit 1
+          fi
+          COLL_UID=$(curl -sf "https://api.getpostman.com/collections?workspace=$WORKSPACE_ID" \
+            -H "x-api-key: ${{ secrets.POSTMAN_API_KEY }}" \
+            | jq -r --arg pat "$COLL_PATTERN" '.collections[] | select(.name | contains($pat)) | .uid' | head -1)
+          if [ -z "$COLL_UID" ]; then
+            echo "::error::No collection matching '$COLL_PATTERN' found in workspace $WORKSPACE_ID"
+            exit 1
+          fi
+          echo "collection_uid=$COLL_UID" >> $GITHUB_OUTPUT
+          echo "Resolved collection: $COLL_UID"
+
+      - name: Resolve Environment UID
+        id: env
+        run: |
+          ENV_UID=$(curl -sf "https://api.getpostman.com/environments" \
+            -H "x-api-key: ${{ secrets.POSTMAN_API_KEY }}" \
+            | jq -r '.environments[] | select(.name | contains("Production")) | .uid' \
+            | while read uid; do
+                WS=$(curl -sf "https://api.getpostman.com/environments/$uid" \
+                  -H "x-api-key: ${{ secrets.POSTMAN_API_KEY }}" \
+                  | jq -r '.environment.owner // empty')
+                echo "$uid"
+                break
+              done | head -1)
+          echo "env_uid=$ENV_UID" >> $GITHUB_OUTPUT
+
+      - name: Run Collection
+        run: |
+          ARGS=""
+          if [ -n "${{ steps.env.outputs.env_uid }}" ]; then
+            ARGS="-e ${{ steps.env.outputs.env_uid }}"
+          fi
+          postman collection run ${{ steps.resolve.outputs.collection_uid }} \
+            $ARGS \
+            --postman-api-key ${{ secrets.POSTMAN_API_KEY }}
+
+      - name: Trigger Monitor Run
+        continue-on-error: true
+        run: |
+          MONITOR_UID=$(curl -sf "https://api.getpostman.com/monitors" \
+            -H "x-api-key: ${{ secrets.POSTMAN_API_KEY }}" \
+            | jq -r --arg pat "$MON_PATTERN" '.monitors[] | select(.name | contains($pat)) | .uid' | head -1)
+          if [ -n "$MONITOR_UID" ]; then
+            echo "Triggering monitor $MONITOR_UID"
+            curl -sf -X POST "https://api.getpostman.com/monitors/$MONITOR_UID/run" \
+              -H "x-api-key: ${{ secrets.POSTMAN_API_KEY }}" || true
+          else
+            echo "No monitor matching '$MON_PATTERN' found, skipping"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Postman Catalog Onboard" >> $GITHUB_STEP_SUMMARY
+          echo "| Asset | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Workspace | [$WORKSPACE_ID](https://go.postman.co/workspace/$WORKSPACE_ID) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Collection | ${{ steps.resolve.outputs.collection_uid }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ steps.env.outputs.env_uid }} |" >> $GITHUB_STEP_SUMMARY

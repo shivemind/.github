@@ -1,0 +1,6 @@
+{
+  "name": "Postman Catalog Onboard",
+  "description": "Automatically runs Postman collection tests, triggers monitors, and reports results to the API Catalog on every push to main. Dynamically resolves collection and monitor UIDs at runtime.",
+  "iconName": "postman-icon",
+  "categories": ["continuous-integration", "testing"]
+}
